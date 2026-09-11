@@ -1,0 +1,245 @@
+#!/bin/bash
+# Local image → Markdown OCR.
+# Prefers Ollama glm-ocr on auto-rotated tiles (full page, tables, handwriting).
+# Layout + spelling polish stays local. Falls back to Apple Vision, then Tesseract.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PREP_BIN="$SCRIPT_DIR/prepare_page_bin"
+PREP_SWIFT="$SCRIPT_DIR/prepare_page.swift"
+VISION_BIN="$SCRIPT_DIR/ocr_to_md_bin"
+VISION_SWIFT="$SCRIPT_DIR/ocr_to_md.swift"
+GLM_PY="$SCRIPT_DIR/glm_ocr.py"
+
+FORCE=0
+STDOUT=0
+ENGINE="auto"
+IMAGES=()
+
+# Colors when stderr is a TTY
+if [[ -t 2 ]]; then
+  C_MAGENTA=$'\033[35m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_MAGENTA=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_DIM=""; C_BOLD=""; C_RESET=""
+fi
+
+log()  { printf '%s\n' "$*" >&2; }
+info() { printf '%s│%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2; }
+ok()   { printf '%s│%s %s%s%s\n' "$C_GREEN" "$C_RESET" "$C_GREEN" "$*" "$C_RESET" >&2; }
+warn() { printf '%s│%s %s%s%s\n' "$C_YELLOW" "$C_RESET" "$C_YELLOW" "$*" "$C_RESET" >&2; }
+
+usage() {
+  cat <<'EOF'
+Usage: ocr-to-md [--force] [--stdout] [--engine auto|glm|vision|tesseract] <image> [image...]
+
+Writes a sibling .md next to each image (Obsidian embed + structured OCR).
+Runs fully locally via Ollama glm-ocr (+ optional polish model).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE=1; shift ;;
+    --stdout) STDOUT=1; shift ;;
+    --engine)
+      ENGINE="${2:-}"
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; IMAGES+=("$@"); break ;;
+    -*)
+      echo "Unknown flag: $1" >&2
+      usage
+      exit 2
+      ;;
+    *) IMAGES+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#IMAGES[@]} -eq 0 ]]; then
+  usage
+  exit 2
+fi
+
+ollama_has_glm() {
+  curl -sf --max-time 2 http://127.0.0.1:11434/api/tags 2>/dev/null \
+    | grep -q '"glm-ocr'
+}
+
+ensure_bin() {
+  local src="$1" bin="$2"
+  if [[ -x "$bin" && "$bin" -nt "$src" ]]; then
+    return 0
+  fi
+  [[ -f "$src" ]] || return 1
+  xcrun swiftc -O -o "$bin" "$src" >/dev/null 2>&1 || return 1
+}
+
+ensure_bin "$PREP_SWIFT" "$PREP_BIN" || true
+ensure_bin "$VISION_SWIFT" "$VISION_BIN" || true
+
+prepare_page() {
+  local img="$1" dest="$2"
+  if [[ -x "$PREP_BIN" ]]; then
+    "$PREP_BIN" "$img" "$dest"
+  else
+    swift "$PREP_SWIFT" "$img" "$dest"
+  fi
+}
+
+tesseract_one() {
+  local img="$1"
+  local out_base
+  out_base="$(mktemp -t ocr-tess)"
+  if ! tesseract "$img" "$out_base" -l eng --oem 1 --psm 6 >/dev/null 2>&1; then
+    rm -f "${out_base}.txt"
+    return 1
+  fi
+  cat "${out_base}.txt"
+  rm -f "${out_base}.txt"
+}
+
+write_md() {
+  local img="$1"
+  local body="$2"
+  local dir base name mdpath
+  dir="$(cd "$(dirname "$img")" && pwd)"
+  base="$(basename "$img")"
+  name="${base%.*}"
+  mdpath="$dir/${name}.md"
+
+  if [[ -f "$mdpath" && "$FORCE" -ne 1 && "$STDOUT" -ne 1 ]]; then
+    warn "exists (use --force): $mdpath"
+    return 0
+  fi
+
+  # glm-ocr already applied house style; Vision/Tesseract still need it.
+  if [[ "${SKIP_FINISH:-0}" != 1 && -f "$GLM_PY" ]]; then
+    body="$(printf '%s' "$body" | python3 "$GLM_PY" --finish-only || printf '%s' "$body")"
+  fi
+
+  local md
+  md="# ${name}
+
+![[${base}]]
+
+${body}
+"
+
+  if [[ "$STDOUT" -eq 1 ]]; then
+    printf '%s' "$md"
+    return 0
+  fi
+  printf '%s' "$md" > "$mdpath"
+  ok "wrote  $mdpath"
+  printf '%s\n' "$mdpath"
+}
+
+run_glm() {
+  local img="$1"
+  local work body
+  work="$(mktemp -d -t ocr-glm)"
+  info "preparing page (rotate · tile)…"
+  if ! prepare_page "$img" "$work" >/dev/null; then
+    rm -rf "$work"
+    return 1
+  fi
+  if [[ ! -f "$work/manifest.json" ]]; then
+    warn "page prepare produced no tiles"
+    rm -rf "$work"
+    return 1
+  fi
+  if ! body="$(python3 "$GLM_PY" "$work")"; then
+    warn "glm-ocr hit a snag — retrying same tiles (staying local, not using Vision)…"
+    if ! body="$(python3 "$GLM_PY" "$work")"; then
+      warn "glm-ocr failed twice. Not falling back to the fast/sloppy engine. Try again."
+      rm -rf "$work"
+      return 1
+    fi
+  fi
+  rm -rf "$work"
+  [[ -n "${body// }" ]] || return 1
+  SKIP_FINISH=1 write_md "$img" "$body"
+}
+
+run_vision() {
+  local -a cmd=()
+  if [[ -x "$VISION_BIN" ]]; then
+    cmd=("$VISION_BIN")
+  else
+    cmd=(swift "$VISION_SWIFT")
+  fi
+  [[ "$FORCE" -eq 1 ]] && cmd+=(--force)
+  [[ "$STDOUT" -eq 1 ]] && cmd+=(--stdout)
+  "${cmd[@]}" "$@"
+}
+
+run_tesseract() {
+  local img abs body
+  for img in "$@"; do
+    abs="$(cd "$(dirname "$img")" && pwd)/$(basename "$img")"
+    if ! body="$(tesseract_one "$abs")"; then
+      warn "Tesseract failed: $abs"
+      return 1
+    fi
+    [[ -z "${body// }" ]] && body="_No text recognized._"
+    write_md "$abs" "$body"
+  done
+}
+
+SKIP_FILE="${OCR_SKIP_FILE:-$HOME/Library/Application Support/ocr-to-md/skipped-images}"
+
+is_skipped() {
+  local img="$1" base
+  [[ -f "$SKIP_FILE" ]] || return 1
+  base="$(basename "$img")"
+  grep -Fxq -- "$base" "$SKIP_FILE" || grep -Fxq -- "$img" "$SKIP_FILE"
+}
+
+one_image() {
+  local img="$1"
+  local abs
+  abs="$(cd "$(dirname "$img")" && pwd)/$(basename "$img")"
+  if [[ "$FORCE" -ne 1 ]] && is_skipped "$abs"; then
+    warn "permanently skipped: $abs"
+    return 0
+  fi
+  printf '\n%s╭─%s %s%s%s\n' "$C_MAGENTA" "$C_RESET" "$C_BOLD" "$(basename "$abs")" "$C_RESET" >&2
+  case "$ENGINE" in
+    glm)
+      run_glm "$abs"
+      ;;
+    vision)
+      run_vision "$abs"
+      ;;
+    tesseract)
+      run_tesseract "$abs"
+      ;;
+    auto)
+      if ollama_has_glm; then
+        run_glm "$abs"
+        return
+      fi
+      warn "glm-ocr not installed → Apple Vision…"
+      if run_vision "$abs"; then
+        return 0
+      fi
+      warn "Vision failed → Tesseract…"
+      run_tesseract "$abs"
+      ;;
+    *)
+      echo "Unknown engine: $ENGINE (use auto, glm, vision, or tesseract)" >&2
+      return 2
+      ;;
+  esac
+}
+
+for img in "${IMAGES[@]}"; do
+  one_image "$img"
+done

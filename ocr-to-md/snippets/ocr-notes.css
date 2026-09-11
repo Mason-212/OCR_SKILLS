@@ -1,0 +1,144 @@
+/* OCR notes — notebook fold. Columns stay side-by-side like the hardcopy. */
+
+.markdown-preview-view p,
+.markdown-preview-view li,
+.markdown-source-view.mod-cm6 .cm-line {
+  line-height: 1.65;
+}
+
+.markdown-preview-view p {
+  margin-top: 0.3em;
+  margin-bottom: 0.75em;
+}
+
+.markdown-preview-view h3,
+.markdown-preview-view h4 {
+  line-height: 1.3;
+  margin-top: 0.35em;
+  margin-bottom: 0.45em;
+}
+
+.markdown-preview-view ul,
+.markdown-preview-view ol {
+  margin: 0.4em 0 0.8em;
+  padding-left: 1.3em;
+}
+
+u {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  text-decoration-thickness: 1.5px;
+  text-decoration-color: var(--text-normal);
+}
+
+.callout[data-callout="columns"],
+.callout[data-callout="columns3"] {
+  --callout-color: transparent;
+  --callout-icon: none;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  margin: 0.6em 0 1.15em;
+  padding: 0;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.callout[data-callout="columns"] > .callout-title,
+.callout[data-callout="columns3"] > .callout-title {
+  display: none;
+}
+
+.callout[data-callout="columns"] > .callout-content,
+.callout[data-callout="columns3"] > .callout-content {
+  display: grid;
+  gap: 0 1.6rem;
+  align-items: start;
+  align-content: start;
+  padding: 0.1em 0 0;
+  background: transparent;
+  width: 100%;
+  height: auto;
+}
+
+/* Two-column fold — Habitat | Niche */
+.callout[data-callout="columns"] > .callout-content {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+/* Three-column fold — Density | Exponential | Logistic */
+.callout[data-callout="columns3"] > .callout-content {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.callout[data-callout="left"],
+.callout[data-callout="mid"],
+.callout[data-callout="right"] {
+  --callout-color: transparent;
+  --callout-icon: none;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  align-self: start;
+  height: max-content !important;
+  overflow: visible;
+}
+
+.callout[data-callout="left"] > .callout-title,
+.callout[data-callout="mid"] > .callout-title,
+.callout[data-callout="right"] > .callout-title {
+  display: none;
+}
+
+.callout[data-callout="left"] > .callout-content,
+.callout[data-callout="mid"] > .callout-content,
+.callout[data-callout="right"] > .callout-content {
+  padding: 0.05em 0.2em 0.2em;
+}
+
+.callout[data-callout="mid"],
+.callout[data-callout="right"] {
+  border-left: 1px solid var(--text-muted) !important;
+  padding-left: 1.35rem;
+  border-radius: 0;
+}
+
+.callout[data-callout="box"] {
+  --callout-color: 110, 110, 110;
+  --callout-icon: none;
+  background: transparent;
+  border: 1.5px solid var(--text-muted);
+  border-radius: 6px;
+  margin: 1.2em 0;
+  padding: 0.15em 0.1em;
+}
+
+.callout[data-callout="box"] > .callout-title {
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.callout[data-callout="box"] > .callout-content {
+  padding: 0.35em 0.85em 0.85em;
+}
+
+@media (max-width: 520px) {
+  .callout[data-callout="columns"] > .callout-content,
+  .callout[data-callout="columns3"] > .callout-content {
+    grid-template-columns: 1fr;
+    gap: 0.9rem;
+  }
+
+  .callout[data-callout="mid"],
+  .callout[data-callout="right"] {
+    border-left: none !important;
+    padding-left: 0;
+    border-top: 1px dashed var(--background-modifier-border) !important;
+    padding-top: 0.9em;
+  }
+}

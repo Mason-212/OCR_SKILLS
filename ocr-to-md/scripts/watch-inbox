@@ -1,0 +1,156 @@
+#!/bin/zsh
+# Watch Obsidian OCR Inbox folder(s); OCR new images into sibling .md files.
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+OCR="$SCRIPT_DIR/ocr-to-md"
+SLEEP_SECS=2
+DISCOVER_EVERY=60
+SKIP_FILE="${OCR_SKIP_FILE:-$HOME/Library/Application Support/ocr-to-md/skipped-images}"
+
+if [[ -t 1 ]]; then
+  C_MAGENTA=$'\033[35m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_MAGENTA=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_DIM=""; C_BOLD=""; C_RESET=""
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: watch-inbox [--force] [--discover ROOT] [folder ...]
+
+Polls each folder for new images and runs ocr-to-md.
+--discover ROOT  re-scan ROOT for directories named "OCR Inbox"
+Skips images that already have a sibling .md unless --force is passed.
+EOF
+}
+
+FORCE_FLAG=()
+DISCOVER_ROOT=""
+FOLDERS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) FORCE_FLAG=(--force); shift ;;
+    --discover)
+      DISCOVER_ROOT="${2:-}"
+      if [[ -z "$DISCOVER_ROOT" ]]; then
+        echo "--discover needs a folder" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    -h|--help) usage; exit 0 ;;
+    *) FOLDERS+=("$1"); shift ;;
+  esac
+done
+
+if [[ -z "$DISCOVER_ROOT" && ${#FOLDERS[@]} -eq 0 ]]; then
+  usage
+  exit 2
+fi
+
+if [[ -n "$DISCOVER_ROOT" ]]; then
+  DISCOVER_ROOT="${DISCOVER_ROOT:A}"
+fi
+
+typeset -A SEEN
+typeset -A FOLDER_MTIME
+WATCHING=()
+LAST_DISCOVER=0
+
+processed_key() {
+  local f="$1"
+  stat -f '%N %m %z' "$f"
+}
+
+is_skipped() {
+  local img="$1" base
+  [[ -f "$SKIP_FILE" ]] || return 1
+  base="${img:t}"
+  grep -Fxq -- "$base" "$SKIP_FILE" || grep -Fxq -- "${img:A}" "$SKIP_FILE"
+}
+
+refresh_folders() {
+  local now=$SECONDS
+  if [[ -n "$DISCOVER_ROOT" && ${#WATCHING[@]} -gt 0 && $((now - LAST_DISCOVER)) -lt $DISCOVER_EVERY ]]; then
+    return
+  fi
+  local -a discovered=()
+  local d
+  if [[ -n "$DISCOVER_ROOT" && -d "$DISCOVER_ROOT" ]]; then
+    while IFS= read -r -d '' d; do
+      discovered+=("$d")
+    done < <(find "$DISCOVER_ROOT" -type d -name 'OCR Inbox' -print0 2>/dev/null)
+  fi
+  local -a combined=("${FOLDERS[@]}" "${discovered[@]}")
+  WATCHING=()
+  for d in "${combined[@]}"; do
+    [[ -d "$d" ]] || mkdir -p "$d"
+    WATCHING+=("${d:A}")
+  done
+  LAST_DISCOVER=$now
+}
+
+scan_folder() {
+  local folder="$1"
+  local img md key mt
+  mt="$(stat -f %m "$folder" 2>/dev/null || echo 0)"
+  if [[ ${#FORCE_FLAG} -eq 0 && "${FOLDER_MTIME[$folder]:-}" == "$mt" ]]; then
+    return
+  fi
+  for img in "$folder"/*(.N) "$folder"/*/*(.N); do
+    [[ -e "$img" ]] || continue
+    case "${img:l}" in
+      *.png|*.jpg|*.jpeg|*.webp|*.heic|*.heif|*.tif|*.tiff|*.gif|*.bmp) ;;
+      *) continue ;;
+    esac
+    if is_skipped "$img"; then
+      continue
+    fi
+    md="${img:r}.md"
+    if [[ ${#FORCE_FLAG} -eq 0 && -f "$md" ]]; then
+      continue
+    fi
+    key="$(processed_key "$img")"
+    if [[ -n "${SEEN[$key]:-}" ]]; then
+      continue
+    fi
+    printf '\n%s◆%s OCR  %s%s%s\n' "$C_MAGENTA" "$C_RESET" "$C_BOLD" "$img" "$C_RESET"
+    if "$OCR" "${FORCE_FLAG[@]}" "$img"; then
+      SEEN[$key]=1
+      printf '%s✓%s done\n' "$C_GREEN" "$C_RESET"
+    else
+      printf '%s✗%s failed: %s\n' "$C_YELLOW" "$C_RESET" "$img" >&2
+      SEEN[$key]=1
+    fi
+  done
+  FOLDER_MTIME[$folder]="$mt"
+}
+
+refresh_folders
+printf '%s╭──────────────────────────────────────╮%s\n' "$C_MAGENTA" "$C_RESET"
+printf '%s│%s  ocr-to-md watcher  ·  local only    %s│%s\n' "$C_MAGENTA" "$C_RESET" "$C_MAGENTA" "$C_RESET"
+printf '%s╰──────────────────────────────────────╯%s\n' "$C_MAGENTA" "$C_RESET"
+
+if [[ ${#WATCHING[@]} -eq 0 ]]; then
+  printf '%s│%s No OCR Inbox folders yet. Waiting under %s\n' "$C_YELLOW" "$C_RESET" "${DISCOVER_ROOT:-<none>}"
+else
+  printf '%s│%s Watching %s%s%s inbox(es)\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "${#WATCHING[@]}" "$C_RESET"
+  for d in "${WATCHING[@]}"; do
+    printf '  %s·%s %s\n' "$C_DIM" "$C_RESET" "$d"
+  done
+fi
+
+while true; do
+  refresh_folders
+  for f in "${WATCHING[@]}"; do
+    scan_folder "$f"
+  done
+  sleep "$SLEEP_SECS"
+done
