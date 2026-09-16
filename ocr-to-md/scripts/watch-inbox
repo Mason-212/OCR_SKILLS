@@ -4,9 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 OCR="$SCRIPT_DIR/ocr-to-md"
-SLEEP_SECS=2
+SLEEP_IDLE="${OCR_SLEEP_IDLE:-8}"
+SLEEP_BUSY="${OCR_SLEEP_BUSY:-2}"
+SLEEP_FAIL="${OCR_SLEEP_FAIL:-20}"
 DISCOVER_EVERY=60
 SKIP_FILE="${OCR_SKIP_FILE:-$HOME/Library/Application Support/ocr-to-md/skipped-images}"
+DEFER_FILE="${OCR_DEFER_FILE:-$HOME/Library/Application Support/ocr-to-md/deferred-images}"
+renice 10 $$ >/dev/null 2>&1 || true
 
 if [[ -t 1 ]]; then
   C_MAGENTA=$'\033[35m'
@@ -61,8 +65,11 @@ fi
 
 typeset -A SEEN
 typeset -A FOLDER_MTIME
+typeset -A FAIL_COUNT
 WATCHING=()
 LAST_DISCOVER=0
+HAD_WORK=0
+HAD_FAIL=0
 
 processed_key() {
   local f="$1"
@@ -74,6 +81,53 @@ is_skipped() {
   [[ -f "$SKIP_FILE" ]] || return 1
   base="${img:t}"
   grep -Fxq -- "$base" "$SKIP_FILE" || grep -Fxq -- "${img:A}" "$SKIP_FILE"
+}
+
+is_deferred() {
+  local img="$1" base
+  [[ -f "$DEFER_FILE" ]] || return 1
+  base="${img:t}"
+  grep -Fxq -- "$base" "$DEFER_FILE" || grep -Fxq -- "${img:A}" "$DEFER_FILE"
+}
+
+clear_deferred() {
+  local img="$1" abs base tmp
+  [[ -f "$DEFER_FILE" ]] || return 0
+  abs="${img:A}"
+  base="${img:t}"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ocr-defer.XXXXXX")"
+  grep -Fxv -- "$abs" "$DEFER_FILE" | grep -Fxv -- "$base" > "$tmp" || true
+  if [[ -s "$tmp" ]]; then
+    mv "$tmp" "$DEFER_FILE"
+  else
+    rm -f "$DEFER_FILE" "$tmp"
+  fi
+}
+
+# True when some other inbox image is waiting and has not been sent to the back.
+has_ready_pending() {
+  local folder img md key
+  for folder in "${WATCHING[@]}"; do
+    for img in "$folder"/*(.N) "$folder"/*/*(.N); do
+      [[ -e "$img" ]] || continue
+      case "${img:l}" in
+        *.png|*.jpg|*.jpeg|*.webp|*.heic|*.heif|*.tif|*.tiff|*.gif|*.bmp) ;;
+        *) continue ;;
+      esac
+      is_skipped "$img" && continue
+      is_deferred "$img" && continue
+      md="${img:r}.md"
+      if [[ ${#FORCE_FLAG} -eq 0 && -f "$md" ]]; then
+        continue
+      fi
+      key="$(processed_key "$img")"
+      if [[ -n "${SEEN[$key]:-}" ]]; then
+        continue
+      fi
+      return 0
+    done
+  done
+  return 1
 }
 
 refresh_folders() {
@@ -99,9 +153,10 @@ refresh_folders() {
 
 scan_folder() {
   local folder="$1"
-  local img md key mt
+  local img md key mt pending=0
   mt="$(stat -f %m "$folder" 2>/dev/null || echo 0)"
-  if [[ ${#FORCE_FLAG} -eq 0 && "${FOLDER_MTIME[$folder]:-}" == "$mt" ]]; then
+  # Defer-file changes do not bump folder mtime, so keep scanning while anything is at the back.
+  if [[ ! -s "$DEFER_FILE" && ${#FORCE_FLAG} -eq 0 && "${FOLDER_MTIME[$folder]:-}" == "$mt" ]]; then
     return
   fi
   for img in "$folder"/*(.N) "$folder"/*/*(.N); do
@@ -121,16 +176,36 @@ scan_folder() {
     if [[ -n "${SEEN[$key]:-}" ]]; then
       continue
     fi
+    if is_deferred "$img" && has_ready_pending; then
+      continue
+    fi
     printf '\n%s◆%s OCR  %s%s%s\n' "$C_MAGENTA" "$C_RESET" "$C_BOLD" "$img" "$C_RESET"
+    HAD_WORK=1
     if "$OCR" "${FORCE_FLAG[@]}" "$img"; then
       SEEN[$key]=1
+      clear_deferred "$img"
       printf '%s✓%s done\n' "$C_GREEN" "$C_RESET"
     else
       printf '%s✗%s failed: %s\n' "$C_YELLOW" "$C_RESET" "$img" >&2
-      SEEN[$key]=1
+      HAD_FAIL=1
+      pending=1
+      if is_deferred "$img"; then
+        # /ocr-terminate killed this page and sent it to the back — not a strike.
+        :
+      else
+        FAIL_COUNT[$img]=$(( ${FAIL_COUNT[$img]:-0} + 1 ))
+        if [[ ${FAIL_COUNT[$img]} -ge 8 ]]; then
+          SEEN[$key]=1
+          printf '%s✗%s giving up after 8 tries: %s\n' "$C_YELLOW" "$C_RESET" "$img" >&2
+        fi
+      fi
     fi
   done
-  FOLDER_MTIME[$folder]="$mt"
+  if [[ $pending -eq 0 ]]; then
+    FOLDER_MTIME[$folder]="$mt"
+  else
+    unset "FOLDER_MTIME[$folder]"
+  fi
 }
 
 refresh_folders
@@ -148,9 +223,17 @@ else
 fi
 
 while true; do
+  HAD_WORK=0
+  HAD_FAIL=0
   refresh_folders
   for f in "${WATCHING[@]}"; do
     scan_folder "$f"
   done
-  sleep "$SLEEP_SECS"
+  if [[ $HAD_FAIL -eq 1 ]]; then
+    sleep "$SLEEP_FAIL"
+  elif [[ $HAD_WORK -eq 1 ]]; then
+    sleep "$SLEEP_BUSY"
+  else
+    sleep "$SLEEP_IDLE"
+  fi
 done

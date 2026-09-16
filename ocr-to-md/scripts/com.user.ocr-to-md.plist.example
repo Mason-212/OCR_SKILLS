@@ -7,24 +7,50 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/mason/.cursor/skills/ocr-to-md/scripts/watch-inbox</string>
+    <string>/Users/Mason/.cursor/skills/ocr-to-md/scripts/watch-inbox</string>
     <string>--discover</string>
-    <string>/Users/mason/school</string>
+    <string>/Users/Mason/school</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/Applications/Ollama.app/Contents/Resources:/usr/bin:/bin</string>
+    <key>OCR_GLM_MODEL</key>
+    <string>glm-ocr:q8_0</string>
+    <key>OCR_LOW_MEM</key>
+    <string>1</string>
+    <key>OCR_NO_POLISH</key>
+    <string>1</string>
+    <key>OCR_KEEP_ALIVE</key>
+    <string>30m</string>
+    <key>OCR_NUM_CTX</key>
+    <string>10240</string>
+    <key>OCR_TILE_MAX</key>
+    <string>1792</string>
+    <key>OCR_NUM_PREDICT</key>
+    <string>4096</string>
+    <key>OLLAMA_FLASH_ATTENTION</key>
+    <string>1</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key>
+    <string>q8_0</string>
+    <key>OLLAMA_NUM_PARALLEL</key>
+    <string>1</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key>
+    <string>1</string>
+    <key>OLLAMA_KEEP_ALIVE</key>
+    <string>30m</string>
+    <key>OLLAMA_CONTEXT_LENGTH</key>
+    <string>10240</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>/Users/mason/Library/Logs/ocr-to-md.log</string>
+  <string>/Users/Mason/Library/Logs/ocr-to-md.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/mason/Library/Logs/ocr-to-md.log</string>
+  <string>/Users/Mason/Library/Logs/ocr-to-md.log</string>
 </dict>
 </plist>

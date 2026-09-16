@@ -9,6 +9,25 @@ PLIST_DEST="$HOME/Library/LaunchAgents/com.user.ocr-to-md.plist"
 LOG_PATH="$HOME/Library/Logs/ocr-to-md.log"
 WATCHER="$SKILL_DIR/scripts/watch-inbox"
 POLISH_MODEL="${OCR_POLISH_MODEL:-llama3.2:3b}"
+RAM_BYTES="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+RAM_GB=$(( RAM_BYTES / 1024 / 1024 / 1024 ))
+LOW_MEM=0
+if [[ "$RAM_GB" -le 8 ]]; then
+  LOW_MEM=1
+fi
+if [[ -z "${OCR_GLM_MODEL:-}" ]]; then
+  if [[ "$LOW_MEM" -eq 1 ]]; then
+    GLM_MODEL="glm-ocr:q8_0"
+  else
+    GLM_MODEL="glm-ocr"
+  fi
+else
+  GLM_MODEL="$OCR_GLM_MODEL"
+fi
+SKIP_POLISH="${OCR_NO_POLISH:-0}"
+if [[ "$LOW_MEM" -eq 1 ]]; then
+  SKIP_POLISH=1
+fi
 
 if [[ -t 1 ]]; then
   C_MAGENTA=$'\033[35m'
@@ -27,7 +46,7 @@ Drop a photo of a worksheet or handwritten notes **in this folder**.
 
 A matching `.md` file appears next to it after OCR finishes (often 2–6 minutes for a dense page — slower on purpose so it stays on glm-ocr). Everything runs **on this Mac** — nothing is uploaded.
 
-Every future page gets the same house style: **bold** key ideas and titles, <u>underlines</u> where you underlined, a blank line between paragraphs, hole-punch words finished from context, and spelling fixed from the rest of the page. Columns stay split; drawn boxes stay boxes. All on this Mac.
+Every future page gets the same house style: **bold** key ideas and titles, <u>underlines</u> where you underlined, a blank line between paragraphs, hole-punch words finished from context, and spelling fixed from the rest of the page. glm-ocr reads the **whole page** (not chopped tiles). Drawn boxes stay boxes. All on this Mac.
 
 You can also paste a photo into any note in this vault. Obsidian saves the image here, and the same markdown file is created.
 
@@ -59,7 +78,13 @@ printf '%s│%s  ocr-to-md setup  ·  all vaults      %s│%s\n' "$C_MAGENTA" "$
 printf '%s╰──────────────────────────────────────╯%s\n' "$C_MAGENTA" "$C_RESET"
 printf '  school root : %s\n' "$SCHOOL_ROOT"
 printf '  watcher     : %s\n' "$WATCHER"
-printf '  polish model: %s\n\n' "$POLISH_MODEL"
+printf '  RAM         : %s GB\n' "$RAM_GB"
+printf '  glm model   : %s\n' "$GLM_MODEL"
+if [[ "$SKIP_POLISH" == 1 ]]; then
+  printf '  polish      : skipped (keep glm-ocr in memory)\n\n'
+else
+  printf '  polish model: %s\n\n' "$POLISH_MODEL"
+fi
 
 # --- Local models (Ollama) -------------------------------------------------
 ensure_ollama() {
@@ -103,8 +128,10 @@ ensure_model() {
 }
 
 if ensure_ollama; then
-  ensure_model "glm-ocr" || true
-  ensure_model "$POLISH_MODEL" || true
+  ensure_model "$GLM_MODEL" || true
+  if [[ "$SKIP_POLISH" != 1 ]]; then
+    ensure_model "$POLISH_MODEL" || true
+  fi
 fi
 
 echo ""
@@ -164,7 +191,7 @@ compile_swift() {
     printf '%s│%s ready: %s\n' "$C_GREEN" "$C_RESET" "$(basename "$bin")"
     return 0
   fi
-  if xcrun swiftc -O -o "$bin" "$src"; then
+  if xcrun swiftc -O -target arm64-apple-macos13 -o "$bin" "$src"; then
     printf '%s│%s compiled %s\n' "$C_GREEN" "$C_RESET" "$(basename "$bin")"
   else
     printf '%s│%s could not compile %s — will run via swift\n' "$C_YELLOW" "$C_RESET" "$(basename "$src")"
@@ -194,11 +221,37 @@ cat > "$PLIST_DEST" <<EOF
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/Applications/Ollama.app/Contents/Resources:/usr/bin:/bin</string>
+    <key>OCR_GLM_MODEL</key>
+    <string>$GLM_MODEL</string>
+    <key>OCR_LOW_MEM</key>
+    <string>$LOW_MEM</string>
+    <key>OCR_NO_POLISH</key>
+    <string>$SKIP_POLISH</string>
+    <key>OCR_KEEP_ALIVE</key>
+    <string>30m</string>
+    <key>OCR_NUM_CTX</key>
+    <string>10240</string>
+    <key>OCR_TILE_MAX</key>
+    <string>1792</string>
+    <key>OCR_NUM_PREDICT</key>
+    <string>4096</string>
+    <key>OLLAMA_FLASH_ATTENTION</key>
+    <string>1</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key>
+    <string>q8_0</string>
+    <key>OLLAMA_NUM_PARALLEL</key>
+    <string>1</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key>
+    <string>1</string>
+    <key>OLLAMA_KEEP_ALIVE</key>
+    <string>30m</string>
+    <key>OLLAMA_CONTEXT_LENGTH</key>
+    <string>10240</string>
   </dict>
   <key>StandardOutPath</key>
   <string>$LOG_PATH</string>
@@ -211,6 +264,31 @@ EOF
 uid="$(id -u)"
 launchctl bootout "gui/$uid/com.user.ocr-to-md" 2>/dev/null || true
 launchctl bootstrap "gui/$uid" "$PLIST_DEST"
+
+if curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  printf '%s│%s warming %s in Ollama (stays loaded)…\n' "$C_CYAN" "$C_RESET" "$GLM_MODEL"
+  python3 - "$GLM_MODEL" <<'PY' || true
+import json, sys, urllib.request
+model = sys.argv[1]
+payload = {
+    "model": model,
+    "prompt": ".",
+    "stream": False,
+    "keep_alive": "30m",
+    "options": {"num_predict": 1, "num_ctx": 10240, "temperature": 0, "num_gpu": 99},
+}
+req = urllib.request.Request(
+    "http://127.0.0.1:11434/api/generate",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    urllib.request.urlopen(req, timeout=180).read()
+except Exception:
+    pass
+PY
+fi
 
 printf '\n%s│%s Watching %s%s%s vault(s). Log: %s\n' \
   "$C_GREEN" "$C_RESET" "$C_BOLD" "$vault_count" "$C_RESET" "$LOG_PATH"

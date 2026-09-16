@@ -1,6 +1,6 @@
 #!/bin/bash
 # Local image → Markdown OCR.
-# Prefers Ollama glm-ocr on auto-rotated tiles (full page, tables, handwriting).
+# Prefers Ollama glm-ocr on the full page (Cursor-style, stays on this Mac).
 # Layout + spelling polish stays local. Falls back to Apple Vision, then Tesseract.
 set -euo pipefail
 
@@ -78,7 +78,7 @@ ensure_bin() {
     return 0
   fi
   [[ -f "$src" ]] || return 1
-  xcrun swiftc -O -o "$bin" "$src" >/dev/null 2>&1 || return 1
+  xcrun swiftc -O -target arm64-apple-macos13 -o "$bin" "$src" >/dev/null 2>&1 || return 1
 }
 
 ensure_bin "$PREP_SWIFT" "$PREP_BIN" || true
@@ -145,18 +145,18 @@ run_glm() {
   local img="$1"
   local work body
   work="$(mktemp -d -t ocr-glm)"
-  info "preparing page (rotate · tile)…"
+  info "preparing page (rotate · enhance · full page)…"
   if ! prepare_page "$img" "$work" >/dev/null; then
     rm -rf "$work"
     return 1
   fi
   if [[ ! -f "$work/manifest.json" ]]; then
-    warn "page prepare produced no tiles"
+    warn "page prepare produced no image"
     rm -rf "$work"
     return 1
   fi
   if ! body="$(python3 "$GLM_PY" "$work")"; then
-    warn "glm-ocr hit a snag — retrying same tiles (staying local, not using Vision)…"
+    warn "glm-ocr hit a snag — retrying the same page (staying local, not using Vision)…"
     if ! body="$(python3 "$GLM_PY" "$work")"; then
       warn "glm-ocr failed twice. Not falling back to the fast/sloppy engine. Try again."
       rm -rf "$work"
@@ -226,12 +226,18 @@ one_image() {
         run_glm "$abs"
         return
       fi
-      warn "glm-ocr not installed → Apple Vision…"
-      if run_vision "$abs"; then
-        return 0
+      # On 8GB we wait for glm-ocr instead of burning the inbox with Vision.
+      if [[ "${OCR_ALLOW_VISION_FALLBACK:-0}" == 1 ]]; then
+        warn "glm-ocr not installed → Apple Vision…"
+        if run_vision "$abs"; then
+          return 0
+        fi
+        warn "Vision failed → Tesseract…"
+        run_tesseract "$abs"
+        return
       fi
-      warn "Vision failed → Tesseract…"
-      run_tesseract "$abs"
+      warn "glm-ocr not ready — skip (watcher will retry)"
+      return 1
       ;;
     *)
       echo "Unknown engine: $ENGINE (use auto, glm, vision, or tesseract)" >&2

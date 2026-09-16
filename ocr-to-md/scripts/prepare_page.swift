@@ -6,15 +6,18 @@ import ImageIO
 import Vision
 
 /// Load a photo (capped decode), rotate handwriting upright, enhance contrast,
-/// detect columns / boxed frames / underlines, write tiles + Vision hints (on-device).
+/// write one full-page JPEG for glm-ocr plus on-device Vision hints (spelling / underlines).
 enum PrepError: Error { case load(String), write(String) }
 
 let imageExts: Set<String> = ["png", "jpg", "jpeg", "webp", "heic", "heif", "tif", "tiff", "gif", "bmp"]
-/// Same cap the OCR engine already used after shrink — avoid decoding 12MP HEIC.
-let workingMaxSide = 3400
-let tileMaxSide = 2200
-let previewMaxSide = 1600
-let orientMaxSide = 1400
+/// 8GB M1: one full page (not column crops). Spend RAM on resolution + 8k–10k context.
+let ramGB = Double(ProcessInfo.processInfo.physicalMemory) / (1024.0 * 1024.0 * 1024.0)
+let lowMem = ProcessInfo.processInfo.environment["OCR_LOW_MEM"] == "1" || ramGB <= 8.5
+let workingMaxSide = lowMem ? 2800 : 3600
+let tileMaxSide = lowMem ? 1792 : 2048
+let previewMaxSide = lowMem ? 1400 : 1600
+let orientMaxSide = lowMem ? 1200 : 1400
+let jpegQuality = lowMem ? 0.88 : 0.93
 
 let ciContext = CIContext(options: [
     .useSoftwareRenderer: false,
@@ -155,12 +158,13 @@ func downscale(_ image: CGImage, maxSide: Int, quality: CGInterpolationQuality =
 }
 
 func upright(_ image: CGImage) -> CGImage {
-    let preview = downscale(image, maxSide: orientMaxSide, quality: .high)
+    let preview = downscale(image, maxSide: orientMaxSide, quality: .medium)
     var bestTimes = 0
     var bestScore = -1.0
     for t in 0..<4 {
         let rotated = t == 0 ? preview : rotate(preview, times90: t)
-        let score = orientationScore(detectText(rotated, accurate: true, correct: true))
+        // Fast pass is enough to pick upright vs sideways; accurate OCR runs later.
+        let score = orientationScore(detectText(rotated, accurate: false, correct: false))
         if score > bestScore {
             bestScore = score
             bestTimes = t
@@ -171,19 +175,24 @@ func upright(_ image: CGImage) -> CGImage {
 }
 
 func enhanceHandwriting(_ image: CGImage) -> CGImage {
-    let ci = CIImage(cgImage: image)
-    // Fade blue graph-paper lines; push ink so handwriting stands off the page.
-    let adjusted = ci.applyingFilter("CIColorControls", parameters: [
-        kCIInputContrastKey: 1.48,
-        kCIInputSaturationKey: 0.28,
-        kCIInputBrightnessKey: 0.07,
+    // Keep the photo close to what glm-ocr was trained on. Heavy contrast/sharpen
+    // fragments ballpoint strokes and makes cursive look like separate glyphs.
+    var ci = CIImage(cgImage: image)
+    ci = ci.applyingFilter("CIHighlightShadowAdjust", parameters: [
+        "inputShadowAmount": 0.32,
+        "inputHighlightAmount": 0.78,
     ])
-    let sharp = adjusted.applyingFilter("CIUnsharpMask", parameters: [
-        kCIInputRadiusKey: 2.1,
-        kCIInputIntensityKey: 0.68,
+    ci = ci.applyingFilter("CIColorControls", parameters: [
+        kCIInputContrastKey: 1.18,
+        kCIInputSaturationKey: 0.86,
+        kCIInputBrightnessKey: 0.02,
     ])
-    let rect = sharp.extent.integral
-    return ciContext.createCGImage(sharp, from: rect) ?? image
+    ci = ci.applyingFilter("CIUnsharpMask", parameters: [
+        kCIInputRadiusKey: 1.05,
+        kCIInputIntensityKey: 0.32,
+    ])
+    let rect = ci.extent.integral
+    return ciContext.createCGImage(ci, from: rect) ?? image
 }
 
 func writeJPEG(_ image: CGImage, to url: URL, quality: Double) throws {
@@ -208,35 +217,52 @@ func imageMidY(_ box: TextBox) -> CGFloat {
     1.0 - box.y - box.h * 0.5
 }
 
+func looksLikeTable(_ boxes: [TextBox], y0: CGFloat, y1: CGFloat) -> Bool {
+    let inBand = boxes.filter { box in
+        let my = imageMidY(box)
+        return my >= y0 && my < y1 && !box.text.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+    guard inBand.count >= 8 else { return false }
+    let short = inBand.filter { $0.text.count <= 10 && $0.w < 0.30 }
+    return short.count >= 6 && short.count * 2 >= inBand.count
+}
+
 func guessedColumns(_ boxes: [TextBox], y0: CGFloat, y1: CGFloat) -> Int {
+    if looksLikeTable(boxes, y0: y0, y1: y1) { return 1 }
     let xs = boxes.compactMap { box -> CGFloat? in
         let my = imageMidY(box)
-        guard my >= y0 && my < y1 && box.w < 0.50 && box.text.count >= 2 else { return nil }
+        guard my >= y0 && my < y1 else { return nil }
+        guard box.w > 0.04, box.w < 0.48, box.text.count >= 3 else { return nil }
         return box.midX
     }.sorted()
-    guard xs.count >= 4 else { return 1 }
+    guard xs.count >= 8 else { return 1 }
     var gaps: [(CGFloat, CGFloat)] = []
     for i in 0..<(xs.count - 1) {
         let gap = xs[i + 1] - xs[i]
-        if gap >= 0.08 {
+        if gap >= 0.10 {
             gaps.append((gap, (xs[i] + xs[i + 1]) / 2))
         }
     }
     gaps.sort { $0.0 > $1.0 }
-    let wide = gaps.filter { $0.0 >= 0.14 }
+    let wide = gaps.filter { $0.0 >= 0.16 && $0.1 > 0.22 && $0.1 < 0.78 }
     if wide.count >= 2 {
         let splits = [wide[0].1, wide[1].1].sorted()
-        if splits[1] - splits[0] >= 0.14 {
+        if splits[1] - splits[0] >= 0.18 {
             let a = xs.filter { $0 < splits[0] }.count
             let b = xs.filter { $0 >= splits[0] && $0 < splits[1] }.count
             let c = xs.filter { $0 >= splits[1] }.count
-            if a >= 2 && b >= 2 && c >= 2 { return 3 }
+            let smallest = min(a, min(b, c))
+            let largest = max(a, max(b, c))
+            if smallest >= 4 && largest <= smallest * 3 { return 3 }
         }
     }
-    if let best = gaps.first, best.0 >= 0.10 {
+    let centered = gaps.filter { $0.0 >= 0.13 && $0.1 >= 0.32 && $0.1 <= 0.68 }
+    if let best = centered.first {
         let left = xs.filter { $0 < best.1 }.count
         let right = xs.filter { $0 >= best.1 }.count
-        if left >= 2 && right >= 2 { return 2 }
+        if left >= 4 && right >= 4 && min(left, right) * 4 >= max(left, right) {
+            return 2
+        }
     }
     return 1
 }
@@ -396,66 +422,67 @@ func spanningY(_ boxes: [TextBox], y0: CGFloat, y1: CGFloat) -> (CGFloat, CGFloa
     return (max(y0, top - 0.008), min(y1, bot + 0.012))
 }
 
+func spanningBands(_ boxes: [TextBox]) -> [(CGFloat, CGFloat)] {
+    var raw: [(CGFloat, CGFloat)] = []
+    for box in boxes where box.w >= 0.70 && box.text.count >= 8 {
+        let top = max(0, imageTop(box) - 0.006)
+        let bot = min(1, imageBot(box) + 0.010)
+        if bot - top < 0.18 {
+            raw.append((top, bot))
+        }
+    }
+    raw.sort { $0.0 < $1.0 }
+    var merged: [(CGFloat, CGFloat)] = []
+    for band in raw {
+        if let last = merged.last, band.0 <= last.1 + 0.025 {
+            merged[merged.count - 1] = (last.0, max(last.1, band.1))
+        } else {
+            merged.append(band)
+        }
+    }
+    return merged.filter { $0.1 - $0.0 < 0.20 }
+}
+
+func appendBand(
+    _ rects: inout [(String, String, Int, Int, Int, Int, Int)],
+    name: String,
+    column: String,
+    zone: Int,
+    width: Int,
+    height: Int,
+    y0: CGFloat,
+    y1: CGFloat,
+    x0: CGFloat = 0,
+    x1: CGFloat = 1
+) {
+    let topY = max(0, Int(y0 * CGFloat(height)))
+    let botY = min(height, Int(y1 * CGFloat(height)))
+    let h = botY - topY
+    let left = max(0, Int(x0 * CGFloat(width)))
+    let right = min(width, Int(x1 * CGFloat(width)))
+    let w = right - left
+    guard h >= 64, w >= 64, y1 - y0 >= 0.05 else { return }
+    rects.append((name, column, zone, left, topY, w, h))
+}
+
 func tileRects(
     width: Int,
     height: Int,
     hintBoxes: [TextBox],
     boxes: [Cluster]
 ) -> [(name: String, column: String, zone: Int, x: Int, y: Int, w: Int, h: Int)] {
+    _ = hintBoxes
+    _ = boxes
     var rects: [(String, String, Int, Int, Int, Int, Int)] = []
-    let aspect = CGFloat(width) / CGFloat(max(1, height))
-    // Phone photo of a few landscape lines: one tile. Splitting invents columns
-    // and cuts sentences in half (then glm-ocr echoes the prompt).
-    let shortLandscape = aspect >= 2.15 || height < 1300
-    if shortLandscape {
-        rects.append(("z0-C", "full", 0, 0, 0, width, height))
-        return rects
-    }
-    let zones = 3
-    let overlapN: CGFloat = 0.03
-    let gutter = max(10, Int(Double(width) * 0.02))
-    for i in 0..<zones {
-        let y0n = max(0, CGFloat(i) / CGFloat(zones) - (i == 0 ? 0 : overlapN))
-        let y1n = min(1, CGFloat(i + 1) / CGFloat(zones) + (i == zones - 1 ? 0 : overlapN))
-        var colY0 = y0n
-        var colY1 = y1n
-        if let (sy0, sy1) = spanningY(hintBoxes, y0: y0n, y1: y1n) {
-            let spanTop = Int(sy0 * CGFloat(height))
-            let spanH = max(40, Int(sy1 * CGFloat(height)) - spanTop)
-            rects.append(("z\(i)-F", "full", i, 0, spanTop, width, spanH))
-            if (sy0 + sy1) / 2 < (y0n + y1n) / 2 {
-                colY0 = min(y1n, sy1 + 0.005)
-            } else {
-                colY1 = max(y0n, sy0 - 0.005)
-            }
-        }
-        let topY = Int(colY0 * CGFloat(height))
-        let h = max(64, Int(colY1 * CGFloat(height)) - topY)
-        guard h >= 64, colY1 - colY0 >= 0.06 else { continue }
-        var cols = guessedColumns(hintBoxes, y0: colY0, y1: colY1)
-        if shortLandscape { cols = 1 }
-        if cols == 3 {
-            let w = width / 3
-            rects.append(("z\(i)-L", "left", i, 0, topY, w + gutter, h))
-            rects.append(("z\(i)-M", "mid", i, w - gutter, topY, w + gutter * 2, h))
-            rects.append(("z\(i)-R", "right", i, 2 * w - gutter, topY, width - (2 * w - gutter), h))
-        } else if cols == 2 {
-            let mid = width / 2
-            rects.append(("z\(i)-L", "left", i, 0, topY, mid + gutter, h))
-            rects.append(("z\(i)-R", "right", i, mid - gutter, topY, width - (mid - gutter), h))
-        } else {
-            rects.append(("z\(i)-C", "full", i, 0, topY, width, h))
-        }
-    }
-    for (i, box) in boxes.prefix(3).enumerated() {
-        let padX = max(8, Int(Double(width) * 0.012))
-        let padY = max(8, Int(Double(height) * 0.01))
-        let x = max(0, Int(box.minX * CGFloat(width)) - padX)
-        let y = max(0, Int((1.0 - box.maxY) * CGFloat(height)) - padY)
-        let w = min(width - x, Int(box.width * CGFloat(width)) + padX * 2)
-        let h = min(height - y, Int(box.height * CGFloat(height)) + padY * 2)
-        if w >= 64, h >= 48 {
-            rects.append(("box-\(i)", "box", 0, x, y, w, h))
+    // One full page, like attaching the photo to Cursor. Column/zone crops
+    // cut handwriting mid-word and stitch it back in the wrong order.
+    rects.append(("page", "full", 0, 0, 0, width, height))
+    // Optional lower band: used only if glm-ocr hits the generation cap.
+    if height >= 1500 {
+        let y = Int(Double(height) * 0.40)
+        let h = height - y
+        if h >= 96 {
+            rects.append(("page-lower", "full", 1, 0, y, width, h))
         }
     }
     return rects
@@ -487,6 +514,7 @@ let preview = downscale(page, maxSide: previewMaxSide, quality: .medium)
 let hintBoxes = detectText(preview, accurate: true, correct: true)
 let pageAspect = CGFloat(page.width) / CGFloat(max(1, page.height))
 let twoCol = (pageAspect >= 2.15 || page.height < 1300) ? false : isTwoColumn(hintBoxes)
+let layoutCols = guessedColumns(hintBoxes, y0: 0.06, y1: 0.94)
 let clusters = clusterText(hintBoxes)
 let boxed = boxedClusters(clusters, twoColumn: twoCol)
 let underlines = underlinedPhrases(preview, boxes: hintBoxes)
@@ -494,31 +522,22 @@ let underlines = underlinedPhrases(preview, boxes: hintBoxes)
 var manifest: [[String: Any]] = []
 let iw = page.width
 let ih = page.height
-var maxCols = 1
+let maxCols = max(layoutCols, twoCol ? 2 : 1)
 for (name, column, zone, xTop, yTop, w, h) in tileRects(width: iw, height: ih, hintBoxes: hintBoxes, boxes: boxed) {
     guard let tile = crop(page, x: xTop, y: yTop, w: w, h: h) else { continue }
     let send = downscale(tile, maxSide: tileMaxSide)
     let tileURL = outDir.appendingPathComponent("\(name).jpg")
-    try writeJPEG(send, to: tileURL, quality: 0.92)
-    let prompt: String
-    if name.hasPrefix("box-") {
-        prompt = "Box Recognition:"
-    } else if column == "left" || column == "right" || column == "mid" {
-        prompt = "Column Recognition:"
-        if column == "mid" { maxCols = max(maxCols, 3) }
-        else { maxCols = max(maxCols, 2) }
-    } else {
-        prompt = "Text Recognition:"
-    }
+    try writeJPEG(send, to: tileURL, quality: jpegQuality)
     manifest.append([
         "file": tileURL.lastPathComponent,
-        "prompt": prompt,
+        "prompt": "Text Recognition:",
         "column": column,
         "zone": zone,
         "x": xTop,
         "y": yTop,
         "w": w,
         "h": h,
+        "continuation": name == "page-lower",
     ])
 }
 
@@ -529,8 +548,9 @@ func redInkWords(_ image: CGImage) -> [String] {
     let bpr = ctx.bytesPerRow
     let ptr = data.bindMemory(to: UInt8.self, capacity: bpr * image.height)
     var sawRed = false
-    for y in 0..<image.height {
-        for x in 0..<image.width {
+    let step = lowMem ? 2 : 1
+    for y in stride(from: 0, to: image.height, by: step) {
+        for x in stride(from: 0, to: image.width, by: step) {
             let o = y * bpr + x * 4
             let r = Int(ptr[o]), g = Int(ptr[o + 1]), b = Int(ptr[o + 2])
             let isRed = r > 130 && r > g + 35 && r > b + 35
